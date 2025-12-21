@@ -5,7 +5,6 @@
 // - Output controls:
 //     * Persisted toggles: Raw vs cleaned, ANSI strip scope (HPLIP-only vs global)
 //     * Timestamped export with save dialog
-// - Build support: CMakeLists.txt provided separately
 //
 // Requires: C++17, gtkmm-3.0, CUPS utilities (lpstat, cancel), HPLIP (hp-info),
 //           optional sudo for cupsdisable/cupsenable/systemctl/journalctl.
