@@ -1,10 +1,11 @@
 // ============================================================
-// HP P1102w Printer Diagnostic Tool (Ultimate)
-// - Full original diagnostic UI (all buttons)
-// - Advanced Queue Manager (auto-refresh, age highlight, cancel selected/user/all, pause/resume)
-// - Output controls:
-//     * Persisted toggles: Raw vs cleaned, ANSI strip scope (HPLIP-only vs global)
-//     * Timestamped export with save dialog
+// HP P1102w Printer Diagnostic Tool (Complete Edition)
+// - Continuous wake mode to prevent deep sleep
+// - Full diagnostic UI with all buttons
+// - Advanced Queue Manager (auto-refresh, age highlight, cancel options)
+// - Output controls (raw/cleaned, ANSI stripping, timestamped export)
+// - Auto-recovery assessment for disabled queues
+// - Config persistence for all settings
 //
 // Requires: C++17, gtkmm-3.0, CUPS utilities (lpstat, cancel), HPLIP (hp-info),
 //           optional sudo for cupsdisable/cupsenable/systemctl/journalctl.
@@ -21,6 +22,7 @@
 #include <sys/select.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -45,8 +47,7 @@ static const std::string PRINTER_IP   = "192.168.4.68";
 static const int         PRINTER_PORT = 9100;
 static const std::string PRINTER_NAME = "HP_LaserJet_Professional_P1102w";
 
-// Config persistence location:
-//   ~/.config/hp_p1102w_printer_diag/config.ini
+// Config persistence location
 static std::string config_dir_path() {
     return Glib::build_filename(Glib::get_user_config_dir(), "hp_p1102w_printer_diag");
 }
@@ -64,7 +65,7 @@ static inline std::string trim_copy(std::string s) {
     return s;
 }
 
-// Strips ANSI escape sequences (best-effort).
+// Strips ANSI escape sequences (best-effort)
 static std::string strip_ansi(const std::string& input) {
     std::string output;
     bool in_escape = false;
@@ -75,7 +76,6 @@ static std::string strip_ansi(const std::string& input) {
             continue;
         }
         if (in_escape) {
-            // ANSI CSI/SGR sequences typically end with a final byte in @..~
             if (c >= '@' && c <= '~') in_escape = false;
             continue;
         }
@@ -98,7 +98,7 @@ static void ensure_config_dir_exists() {
     try {
         if (!dir->query_exists()) dir->make_directory_with_parents();
     } catch (...) {
-        // Non-fatal: we just won't persist.
+        // Non-fatal
     }
 }
 
@@ -114,7 +114,7 @@ struct PrintJob {
 };
 
 // ============================================================
-// CupsClient abstraction (lpstat/cancel + queue enable/disable)
+// CupsClient abstraction
 // ============================================================
 class CupsClient {
 public:
@@ -123,6 +123,48 @@ public:
 
     std::string printer_state_raw() {
         return m_exec("lpstat -p \"" + PRINTER_NAME + "\" 2>&1");
+    }
+
+    std::string printer_long_raw() {
+        return m_exec("lpstat -l -p \"" + PRINTER_NAME + "\" 2>&1");
+    }
+
+    std::string get_printer_friendly_name() {
+        const std::string out = printer_long_raw();
+        std::istringstream iss(out);
+        std::string line;
+        while (std::getline(iss, line)) {
+            auto pos = line.find("Description:");
+            if (pos != std::string::npos) {
+                std::string desc = line.substr(pos + 12);
+                auto l = desc.find_first_not_of(" \t");
+                auto r = desc.find_last_not_of(" \t\r\n");
+                if (l != std::string::npos && r != std::string::npos) 
+                    desc = desc.substr(l, r - l + 1);
+                if (!desc.empty()) return desc;
+            }
+        }
+        return PRINTER_NAME;
+    }
+
+    bool has_recoverable_reason_hint(std::string* matched_reason = nullptr) {
+        std::string out = printer_long_raw();
+        std::transform(out.begin(), out.end(), out.begin(), 
+                      [](unsigned char c){ return (char)std::tolower(c); });
+
+        const std::vector<std::pair<std::string, std::string>> needles = {
+            {"out of paper", "out of paper"},
+            {"media-empty", "media-empty"},
+            {"media empty", "media empty"},
+        };
+
+        for (const auto& p : needles) {
+            if (out.find(p.first) != std::string::npos) {
+                if (matched_reason) *matched_reason = p.second;
+                return true;
+            }
+        }
+        return false;
     }
 
     bool queue_disabled() {
@@ -163,7 +205,6 @@ private:
     std::function<std::string(const std::string&)> m_exec;
 
     static std::optional<std::chrono::system_clock::time_point> parse_datetime_from_line(const std::string& rest) {
-        // Best-effort: parse "20 Dec 2025 10:11:12" token sequence if present.
         static const std::vector<std::string> months = {
             "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"
         };
@@ -199,7 +240,6 @@ private:
                 tm = tm2;
             }
 
-            // Handle optional AM/PM token
             if (i + 3 < tokens.size()) {
                 std::string ampm = tokens[i + 3];
                 if (ampm == "AM" || ampm == "PM") {
@@ -225,7 +265,6 @@ private:
 
     static std::vector<PrintJob> parse_lpstat_jobs(const std::string& text) {
         std::vector<PrintJob> jobs;
-
         std::istringstream ss(text);
         std::string line;
 
@@ -477,7 +516,7 @@ private:
 
     void apply_highlight_only() {
         const int threshold = (int)m_spin_age.get_value();
-        const std::string color = "#3b2f1b"; // subtle amber-ish
+        const std::string color = "#3b2f1b";
 
         for (auto& row : m_store->children()) {
             int age = row[m_cols.age_minutes];
@@ -620,6 +659,7 @@ private:
     // Layout
     Gtk::Box m_vbox{Gtk::ORIENTATION_VERTICAL};
     Gtk::Box m_topbar{Gtk::ORIENTATION_HORIZONTAL};
+    Gtk::Box m_wakebar{Gtk::ORIENTATION_HORIZONTAL};
     Gtk::Box m_hbox{Gtk::ORIENTATION_HORIZONTAL};
     Gtk::Box m_leftbox{Gtk::ORIENTATION_VERTICAL};
     Gtk::ScrolledWindow m_scrolled;
@@ -631,6 +671,12 @@ private:
     Gtk::CheckButton m_chk_strip_global{"Strip ANSI globally"};
     Gtk::CheckButton m_chk_strip_hplip{"Strip ANSI for HPLIP (hp-info)"};
     Gtk::Button m_btn_export{"Export Output"};
+
+    // Continuous wake controls
+    Gtk::CheckButton m_chk_wake_enabled{"Enable Continuous Wake Mode"};
+    Gtk::Label m_lbl_wake_interval{"Wake interval (min):"};
+    Gtk::SpinButton m_spin_wake_interval;
+    Gtk::Label m_lbl_wake_status{"Status: Disabled"};
 
     // Buttons
     Gtk::Button m_btn_quick_test{"1. Quick Test (ping + port check)"};
@@ -662,6 +708,9 @@ private:
     bool m_show_raw = false;
     bool m_strip_global = false;
     bool m_strip_hplip = true;
+    bool m_wake_enabled = false;
+    int m_wake_interval_minutes = 5;
+    sigc::connection m_wake_timer_conn;
 
     // CUPS client
     std::unique_ptr<CupsClient> m_cups;
@@ -672,8 +721,6 @@ private:
 
     // Output helpers
     void print_header(const std::string& text);
-
-    // Scroll helper (gtkmm requires lvalue iterator)
     void scroll_to_end();
     void print_success(const std::string& text);
     void print_error(const std::string& text);
@@ -702,6 +749,12 @@ private:
     void open_queue_manager();
     void export_output();
 
+    // Continuous wake
+    void start_wake_timer();
+    void stop_wake_timer();
+    void send_wake_silent();
+    void update_wake_status();
+
     // Button handlers
     void on_quick_test();
     void on_full_diagnostic();
@@ -720,8 +773,8 @@ private:
 };
 
 PrinterDiagnostic::PrinterDiagnostic() {
-    set_title("HP P1102w Printer Diagnostic Tool");
-    set_default_size(1000, 680);
+    set_title("HP P1102w Printer Diagnostic Tool - Complete Edition");
+    set_default_size(1000, 720);
 
     // Buffer + view
     m_buffer = Gtk::TextBuffer::create();
@@ -744,12 +797,13 @@ PrinterDiagnostic::PrinterDiagnostic() {
     // Layout
     add(m_vbox);
     m_vbox.pack_start(m_topbar, false, false, 6);
+    m_vbox.pack_start(m_wakebar, false, false, 6);
     m_vbox.pack_start(m_hbox, true, true, 0);
 
+    // Top bar - Output controls
     m_topbar.set_spacing(10);
     m_topbar.set_border_width(6);
 
-    // Apply state to widgets
     m_chk_raw.set_active(m_show_raw);
     m_chk_strip_global.set_active(m_strip_global);
     m_chk_strip_hplip.set_active(m_strip_hplip);
@@ -759,12 +813,26 @@ PrinterDiagnostic::PrinterDiagnostic() {
     m_topbar.pack_start(m_chk_strip_hplip, false, false, 0);
     m_topbar.pack_end(m_btn_export, false, false, 0);
 
+    // Wake bar - Continuous wake controls
+    m_wakebar.set_spacing(10);
+    m_wakebar.set_border_width(6);
 
-    // Settings info labels
+    m_chk_wake_enabled.set_active(m_wake_enabled);
+    m_spin_wake_interval.set_range(1, 60);
+    m_spin_wake_interval.set_increments(1, 5);
+    m_spin_wake_interval.set_value(m_wake_interval_minutes);
+    m_lbl_wake_status.set_xalign(0.0f);
+
+    m_wakebar.pack_start(m_chk_wake_enabled, false, false, 0);
+    m_wakebar.pack_start(m_lbl_wake_interval, false, false, 0);
+    m_wakebar.pack_start(m_spin_wake_interval, false, false, 0);
+    m_wakebar.pack_start(m_lbl_wake_status, true, true, 0);
+
+    // Settings info
     Gtk::Box* settings_box = Gtk::manage(new Gtk::Box(Gtk::ORIENTATION_VERTICAL));
     settings_box->set_spacing(2);
 
-    Gtk::Label* lbl_settings = Gtk::manage(new Gtk::Label("Settings:"));
+    Gtk::Label* lbl_settings = Gtk::manage(new Gtk::Label("Output Settings:"));
     lbl_settings->set_xalign(0.0f);
 
     Gtk::Label* lbl_raw = Gtk::manage(new Gtk::Label(
@@ -779,18 +847,25 @@ PrinterDiagnostic::PrinterDiagnostic() {
         "• Strip ANSI for HPLIP only: clean hp-info output while leaving others untouched."));
     lbl_hplip->set_xalign(0.0f);
 
+    Gtk::Label* lbl_wake = Gtk::manage(new Gtk::Label(
+        "• Continuous Wake: automatically send wake commands at regular intervals to prevent deep sleep."));
+    lbl_wake->set_xalign(0.0f);
+
     settings_box->pack_start(*lbl_settings, false, false, 0);
     settings_box->pack_start(*lbl_raw, false, false, 0);
     settings_box->pack_start(*lbl_global, false, false, 0);
     settings_box->pack_start(*lbl_hplip, false, false, 0);
+    settings_box->pack_start(*lbl_wake, false, false, 0);
 
     m_vbox.pack_start(*settings_box, false, false, 6);
 
     auto update_toggle_sensitivity = [this]() {
-        // If raw output is enabled, stripping toggles don't matter; still show but disable for clarity.
         bool raw = m_chk_raw.get_active();
         m_chk_strip_global.set_sensitive(!raw);
         m_chk_strip_hplip.set_sensitive(!raw && !m_chk_strip_global.get_active());
+        
+        bool wake_on = m_chk_wake_enabled.get_active();
+        m_spin_wake_interval.set_sensitive(wake_on);
     };
     update_toggle_sensitivity();
 
@@ -802,9 +877,6 @@ PrinterDiagnostic::PrinterDiagnostic() {
 
     m_chk_strip_global.signal_toggled().connect([this, update_toggle_sensitivity]() {
         m_strip_global = m_chk_strip_global.get_active();
-        if (m_strip_global) {
-            // Global implies HPLIP-only is irrelevant; keep its state but disable it.
-        }
         update_toggle_sensitivity();
         save_config();
     });
@@ -815,6 +887,25 @@ PrinterDiagnostic::PrinterDiagnostic() {
         save_config();
     });
 
+    m_chk_wake_enabled.signal_toggled().connect([this, update_toggle_sensitivity]() {
+        m_wake_enabled = m_chk_wake_enabled.get_active();
+        if (m_wake_enabled) {
+            start_wake_timer();
+        } else {
+            stop_wake_timer();
+        }
+        update_toggle_sensitivity();
+        save_config();
+    });
+
+    m_spin_wake_interval.signal_value_changed().connect([this]() {
+        m_wake_interval_minutes = (int)m_spin_wake_interval.get_value();
+        if (m_wake_enabled) {
+            start_wake_timer();  // Restart with new interval
+        }
+        save_config();
+    });
+
     m_btn_export.signal_clicked().connect(sigc::mem_fun(*this, &PrinterDiagnostic::on_export));
 
     // Left panel
@@ -822,11 +913,20 @@ PrinterDiagnostic::PrinterDiagnostic() {
     m_leftbox.set_spacing(4);
     m_hbox.pack_start(m_leftbox, false, false, 0);
 
-    Gtk::Label lbl_printer("Printer: " + PRINTER_NAME); lbl_printer.set_xalign(0.0f);
+    // CUPS client for friendly name
+    m_cups = std::make_unique<CupsClient>([this](const std::string& cmd) {
+        return this->execute_command(cmd, false);
+    });
+
+    std::string friendly_name = m_cups->get_printer_friendly_name();
+
+    Gtk::Label lbl_printer("Printer: " + friendly_name); lbl_printer.set_xalign(0.0f);
+    Gtk::Label lbl_queue("CUPS Queue: " + PRINTER_NAME); lbl_queue.set_xalign(0.0f);
     Gtk::Label lbl_ip("IP Address: " + PRINTER_IP); lbl_ip.set_xalign(0.0f);
     Gtk::Label lbl_port("Port: " + std::to_string(PRINTER_PORT)); lbl_port.set_xalign(0.0f);
 
     m_leftbox.pack_start(lbl_printer, false, false, 0);
+    m_leftbox.pack_start(lbl_queue, false, false, 0);
     m_leftbox.pack_start(lbl_ip, false, false, 0);
     m_leftbox.pack_start(lbl_port, false, false, 0);
 
@@ -875,13 +975,16 @@ PrinterDiagnostic::PrinterDiagnostic() {
     m_scrolled.set_policy(Gtk::POLICY_AUTOMATIC, Gtk::POLICY_AUTOMATIC);
     m_hbox.pack_start(m_scrolled, true, true, 0);
 
-    // CUPS client
-    m_cups = std::make_unique<CupsClient>([this](const std::string& cmd) {
-        return this->execute_command(cmd, false);
+    // Persist on window hide
+    signal_hide().connect([this]() { 
+        stop_wake_timer();
+        save_config(); 
     });
 
-    // Persist on window hide (best-effort)
-    signal_hide().connect([this]() { save_config(); });
+    // Start wake timer if enabled
+    if (m_wake_enabled) {
+        start_wake_timer();
+    }
 
     show_all_children();
 }
@@ -890,7 +993,6 @@ PrinterDiagnostic::PrinterDiagnostic() {
 // Config persistence
 // ============================================================
 void PrinterDiagnostic::load_config() {
-    // Defaults already set in members.
     ensure_config_dir_exists();
 
     Glib::KeyFile kf;
@@ -899,8 +1001,10 @@ void PrinterDiagnostic::load_config() {
         m_show_raw = kf.get_boolean("output", "raw");
         m_strip_global = kf.get_boolean("output", "strip_global");
         m_strip_hplip = kf.get_boolean("output", "strip_hplip");
+        m_wake_enabled = kf.get_boolean("wake", "enabled");
+        m_wake_interval_minutes = kf.get_integer("wake", "interval_minutes");
     } catch (...) {
-        // ignore; keep defaults
+        // Keep defaults
     }
 }
 
@@ -911,12 +1015,67 @@ void PrinterDiagnostic::save_config() {
         kf.set_boolean("output", "raw", m_show_raw);
         kf.set_boolean("output", "strip_global", m_strip_global);
         kf.set_boolean("output", "strip_hplip", m_strip_hplip);
+        kf.set_boolean("wake", "enabled", m_wake_enabled);
+        kf.set_integer("wake", "interval_minutes", m_wake_interval_minutes);
 
         std::string data = kf.to_data();
         std::ofstream out(config_file_path(), std::ios::binary);
         if (out) out << data;
     } catch (...) {
-        // ignore
+        // Ignore
+    }
+}
+
+// ============================================================
+// Continuous wake functions
+// ============================================================
+void PrinterDiagnostic::start_wake_timer() {
+    stop_wake_timer();  // Clear existing timer
+    
+    if (m_wake_interval_minutes <= 0) return;
+    
+    // Convert minutes to seconds for the timer
+    int interval_seconds = m_wake_interval_minutes * 60;
+    
+    m_wake_timer_conn = Glib::signal_timeout().connect_seconds([this]() -> bool {
+        send_wake_silent();
+        return true;  // Keep running
+    }, interval_seconds);
+    
+    update_wake_status();
+}
+
+void PrinterDiagnostic::stop_wake_timer() {
+    if (m_wake_timer_conn.connected()) {
+        m_wake_timer_conn.disconnect();
+    }
+    update_wake_status();
+}
+
+void PrinterDiagnostic::send_wake_silent() {
+    // Send wake command without logging to output
+    std::string cmd =
+        "printf '\\x1B%%-12345X@PJL\\r\\n@PJL INFO STATUS\\r\\n\\x1B%%-12345X\\r\\n' | "
+        "nc " + PRINTER_IP + " " + std::to_string(PRINTER_PORT) + " -w 3 2>/dev/null";
+    execute_command(cmd, false);
+    
+    update_wake_status();
+}
+
+void PrinterDiagnostic::update_wake_status() {
+    if (m_wake_enabled && m_wake_timer_conn.connected()) {
+        std::time_t t = std::time(nullptr);
+        std::tm tm{};
+        localtime_r(&t, &tm);
+        char time_str[32];
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", &tm);
+        
+        m_lbl_wake_status.set_markup(
+            "<span foreground='green'>Status: <b>ACTIVE</b></span>  |  "
+            "Interval: " + std::to_string(m_wake_interval_minutes) + " min  |  "
+            "Last wake: " + std::string(time_str));
+    } else {
+        m_lbl_wake_status.set_markup("<span foreground='red'>Status: <b>DISABLED</b></span>");
     }
 }
 
@@ -948,7 +1107,6 @@ void PrinterDiagnostic::print_info(const std::string& text) {
     scroll_to_end();
 }
 
-
 void PrinterDiagnostic::scroll_to_end() {
     auto iter = m_buffer->end();
     m_textview.scroll_to(iter);
@@ -970,11 +1128,7 @@ std::string PrinterDiagnostic::execute_command(const std::string& cmd, bool is_h
     }
 
     if (m_show_raw) return result;
-
-    // If user enabled global stripping, always strip.
     if (m_strip_global) return strip_ansi(result);
-
-    // Otherwise, strip only for HPLIP if enabled.
     if (is_hplip && m_strip_hplip) return strip_ansi(result);
 
     return result;
@@ -1064,8 +1218,7 @@ bool PrinterDiagnostic::check_port_9100() {
 
 bool PrinterDiagnostic::check_cups_status() {
     print_info("Checking CUPS printer queue...");
-    std::string cmd = "lpstat -p \"" + PRINTER_NAME + "\" 2>&1";
-    std::string result = execute_command(cmd, false);
+    std::string result = m_cups->printer_state_raw();
 
     if (result.find("idle") != std::string::npos) {
         print_success("CUPS queue is idle and ready");
@@ -1074,6 +1227,30 @@ bool PrinterDiagnostic::check_cups_status() {
     if (result.find("disabled") != std::string::npos) {
         print_error("CUPS queue is DISABLED");
         print_warning("Run: sudo cupsenable \"" + PRINTER_NAME + "\"");
+
+        // Auto-recovery assessment (from dev version)
+        try {
+            const auto jobs = m_cups->get_jobs();
+            const bool queue_empty = jobs.empty();
+
+            std::string matched_reason;
+            const bool recoverable_hint = m_cups->has_recoverable_reason_hint(&matched_reason);
+
+            if (queue_empty && recoverable_hint) {
+                print_success("Auto-Recovery eligible: queue is empty and reason looks recoverable (" + matched_reason + ").");
+                print_info("Would run: cupsenable + cupsaccept for this queue (not auto-executed).");
+            } else {
+                if (!queue_empty) {
+                    print_warning("Auto-Recovery skipped: queue is not empty (active/pending jobs present).");
+                } else {
+                    print_warning("Auto-Recovery skipped: reason not recognized as safely recoverable.");
+                    print_info("Tip: If this is truly stale (e.g., you added paper), manually re-enable via CUPS.");
+                }
+            }
+        } catch (const std::exception& e) {
+            print_warning(std::string("Auto-Recovery assessment failed: ") + e.what());
+        }
+
         return false;
     }
 
@@ -1117,8 +1294,9 @@ bool PrinterDiagnostic::get_printer_info() {
     std::string cmd = "hp-info -d hp:/net/" + PRINTER_NAME + "?ip=" + PRINTER_IP + " 2>&1";
     std::string result = execute_command(cmd, true);
 
-    if (result.find("Device") != std::string::npos || result.find("Communication status") != std::string::npos) {
-        print_success("HPLIP returned device info");
+    if (result.find("Communication status: Good") != std::string::npos || 
+        result.find("Device") != std::string::npos) {
+        print_success("HPLIP can communicate with printer");
         m_buffer->insert_with_tag(m_buffer->end(), "\n" + result + "\n", m_tag_white);
         return true;
     }
@@ -1145,6 +1323,10 @@ void PrinterDiagnostic::send_wake_command() {
     execute_command(cmd, false);
     sleep(2);
     print_success("Wake command sent - wait 5 seconds then test again");
+    
+    if (m_wake_enabled) {
+        update_wake_status();  // Update status with new timestamp
+    }
 }
 
 void PrinterDiagnostic::restart_cups() {
@@ -1190,7 +1372,6 @@ void PrinterDiagnostic::export_output() {
     dlg.add_button("_Cancel", Gtk::RESPONSE_CANCEL);
     dlg.add_button("_Save", Gtk::RESPONSE_OK);
 
-    // Timestamped default name
     dlg.set_current_name("printer_diagnostic_" + now_timestamp_yyyymmdd_hhmmss() + ".txt");
 
     if (dlg.run() == Gtk::RESPONSE_OK) {
@@ -1222,6 +1403,7 @@ void PrinterDiagnostic::on_quick_test() {
     } else if (ping_ok && !port_ok) {
         print_warning("Printer is online but print service is asleep");
         print_info("Recommended action: Press printer power button or use option 8");
+        print_info("Or enable Continuous Wake Mode to prevent future sleep");
     } else {
         print_error("Printer is not reachable on network");
         print_info("Check: Printer power, WiFi status, router/bridge path");
@@ -1250,8 +1432,12 @@ void PrinterDiagnostic::on_full_diagnostic() {
     print_header("Diagnostic Summary");
     bool all_ok = ping && port && cups && jobs && plugin;
 
-    if (all_ok) print_success("All diagnostics passed! Printer should be working.");
-    else {
+    if (all_ok) {
+        print_success("All diagnostics passed! Printer should be working.");
+        if (!m_wake_enabled) {
+            print_info("Tip: Enable Continuous Wake Mode to prevent printer from sleeping");
+        }
+    } else {
         print_warning("Some issues detected. Review the results above.");
         print_info("Use the FIX menu options to resolve issues");
     }
@@ -1321,6 +1507,7 @@ void PrinterDiagnostic::on_export() {
 }
 
 void PrinterDiagnostic::on_exit() {
+    stop_wake_timer();
     save_config();
     hide();
 }
