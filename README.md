@@ -2,7 +2,7 @@
 
 A GTKmm-based Linux GUI tool for diagnosing and managing an HP P1102w printer, including queue inspection, job management, and connectivity checks.
 
-<img width="590" height="499" alt="image" src="https://github.com/user-attachments/assets/c3e36fe1-1dda-4a40-a78f-309e644b658d" />
+<img width="1000" height="752" alt="image" src="https://github.com/user-attachments/assets/dbe9c6c8-3ae0-417e-a3d2-d9b4e70c9929" />
 
 ## Why This Exists
 
